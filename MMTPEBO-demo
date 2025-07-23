@@ -1,0 +1,292 @@
+import torch
+import numpy as np
+from tqdm import tqdm
+from matplotlib.pyplot import MultipleLocator
+from botorch.fit import fit_gpytorch_model
+from botorch.models import SingleTaskGP
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from botorch.optim import optimize_acqf
+from botorch.acquisition import ExpectedImprovement, UpperConfidenceBound
+from pysampling.sample import sample
+import os
+import matplotlib.pyplot as plt
+from matplotlib import gridspec
+import matplotlib.ticker as ticker
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+dtype = torch.double
+
+# objective function
+def objective3(x, z):
+    f = np.sin(x-z)/np.sqrt(np.power(x, 2) + np.power(z, 2))
+    return f
+
+
+## build GP model
+## initialize a GP with data
+## use likelihood to find GP params
+def get_model(train_x, train_obj, state_dict=None, debug=False):
+    gp = SingleTaskGP(train_x, train_obj)
+    mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+    if state_dict is not None:
+        gp.load_state_dict(state_dict) # speeds up fit
+    fit_gpytorch_model(mll) # performs the hyperparam fit
+    return gp, mll
+
+# population number
+population_n = 10
+
+# Initial design of the experiment by LHD
+train_x_z = sample("lhs", population_n, 2)    #20 points
+train_x = np.expand_dims(train_x_z[:, 0], axis=1)
+train_x = train_x*10
+train_z = np.expand_dims(train_x_z[:, 1], axis=1)
+train_z = train_z*10
+train_x_z = np.concatenate((train_x, train_z), axis=1)
+train_x_z = torch.tensor(train_x_z, dtype=dtype)
+
+# evaluate objective of initial
+train_obj = objective3(train_x, train_z)
+train_obj = torch.tensor(train_obj, dtype=dtype)
+
+# generate initial population
+population = torch.cat((train_obj, train_x_z), 1)
+
+
+# fit GP model by initial points
+model, mll = get_model(train_x_z, train_obj)
+
+def step(model, train_x_z, train_obj, beta=5.):
+    # optimize acquisition function
+    UCB = UpperConfidenceBound(model=model, beta=beta)
+    new_point_analytic, acq_value_list = optimize_acqf(
+                acq_function=UCB,
+                bounds=torch.tensor([[0.000000000001, 0.000000000001], [10., 10]]),
+                q=1,
+                num_restarts=20,
+                raw_samples=10000,
+                options={},
+                return_best_only=True,
+                sequential=False
+    )
+    new_point_analytic_x = new_point_analytic[:, 0]
+    new_point_analytic_z = new_point_analytic[:, 1]
+    smth = objective3(new_point_analytic_x, new_point_analytic_z)
+    smth = smth.unsqueeze(0)
+    train_obj = torch.cat([smth, train_obj])
+    train_x_z = torch.cat([new_point_analytic, train_x_z])
+
+    model, mll = get_model(train_x_z, train_obj, model.state_dict())
+    return model, mll, train_x_z, train_obj, new_point_analytic_x, new_point_analytic_z
+
+def GetWorseUncontrol(model, fixed_control, train_x_z, train_obj, beta=5.):
+    # optimize acquisition function
+    UCB = UpperConfidenceBound(model=model, beta=beta)
+    new_point_analytic, acq_value_list = optimize_acqf(
+                acq_function=UCB,
+                bounds=torch.tensor([[fixed_control, 0.000000000001], [fixed_control, 10]]),
+                q=1,
+                num_restarts=20,
+                raw_samples=10000,
+                options={},
+                return_best_only=True,
+                sequential=False
+    )
+    print('the new_point_analytic :', new_point_analytic)
+    print('the new_point_analytic shape :', new_point_analytic.shape)
+    new_point_analytic_x = new_point_analytic[:, 0]
+    print('the new_point_analytic_x :', new_point_analytic_x)
+    print('the new_point_analytic_x shape :', new_point_analytic_x.shape)
+    new_point_analytic_z = new_point_analytic[:, 1]
+    print('the new_point_analytic_z :', new_point_analytic_z)
+    print('the new_point_analytic_z shape :', new_point_analytic_z.shape)
+    smth = objective3(new_point_analytic_x, new_point_analytic_z)
+    new_point_analytic_f = smth
+    smth = smth.unsqueeze(0)
+    train_obj = torch.cat([smth, train_obj])
+    train_x_z = torch.cat([new_point_analytic, train_x_z])
+
+    model, mll = get_model(train_x_z, train_obj, model.state_dict())
+    return model, mll, train_x_z, train_obj, new_point_analytic_x, new_point_analytic_z, new_point_analytic_f
+
+
+def GetOptimum(population):
+    sorted_population, sorted_indices = torch.sort(population, descending=False, dim=0)
+    optimum_indices = sorted_indices[0, 0]
+    optimum = population[optimum_indices, :]
+    return optimum, optimum_indices
+
+def GetSortedIndices(population):
+    _, sorted_indices = torch.sort(population, descending=False, dim=0)
+    return sorted_indices
+
+def plot(optimum_control):
+    with torch.no_grad():
+        plot_posterior_x = np.linspace(0.0000000000001, 10, 1000)
+        plot_posterior_z = np.linspace(0.0000000000001, 10, 1000)
+
+        plot_posterior_X, plot_posterior_Z = np.meshgrid(plot_posterior_x, plot_posterior_z)
+
+        plot_posterior_X_Z = np.dstack((plot_posterior_X, plot_posterior_Z))
+        plot_posterior_X_Z = torch.tensor(plot_posterior_X_Z, dtype=dtype)
+
+        mean_preds = model(plot_posterior_X_Z).mean
+
+        plt.rc('font', family='Times New Roman')
+        plt.rc('legend', fontsize=8)
+        plt.rcParams['font.size'] = 8
+        plt.figure(figsize=(1.7, 1.4))
+        lable_fontsize = 8
+
+        # plt.axvline(x=optimum_control, c='red', linewidth=1, label='Optimum')
+        ax1 = plt.imshow(mean_preds, cmap='viridis', vmin=-1, vmax=1, extent=[0, 10, 0, 10]) # vmin=-1, vmax=1,
+        cb1 = plt.colorbar(ax1)
+        plt.scatter(population[:, 1], population[:, 2], marker='d', label='Observations', s=3, c='white')
+        plt.scatter(train_x_z[:, 0], train_x_z[:, 1], label='Observations', s=1, c='black')
+        print('the optimum is :', optimum_control)
+
+        tick_locator = ticker.MaxNLocator(nbins=6)  # colorbar上的刻度值个数
+        cb1.locator = tick_locator
+        cb1.update_ticks()
+
+        x_major_locator = MultipleLocator(2)
+        # 把x轴的刻度间隔设置为1，并存在变量里
+        y_major_locator = MultipleLocator(2)
+        # 把y轴的刻度间隔设置为10，并存在变量里
+        ax = plt.gca()
+        # ax为两条坐标轴的实例
+        ax.xaxis.set_major_locator(x_major_locator)
+        # 把x轴的主刻度设置为1的倍数
+        ax.yaxis.set_major_locator(y_major_locator)
+        # 把y轴的主刻度设置为10的倍数
+        plt.xlim(0, 10)
+        # 把x轴的刻度范围设置为-0.5到11，因为0.5不满一个刻度间隔，所以数字不会显示出来，但是能看到一点空白
+        plt.ylim(0, 10)
+        # 把y轴的刻度范围设置为-5到110，同理，-5不会标出来，但是能看到一点空白
+
+        figure_save_path = "figures/BOAESobjective3/"
+        plt.tight_layout()
+        figure_name = 'The' + str(Generation) + 'th generation.svg'
+        plt.savefig(os.path.join(figure_save_path, figure_name))
+        plt.close()
+        # fig, ax = plt.subplots(2, 1, sharey=True, figsize=(4, 4))
+        # ax[0].set_title("Exploitation")
+        # ax[0].contourf(plot_posterior_X, plot_posterior_Z, mean_preds, 200, alpha=1)
+        # ax[0].scatter(train_x_z[:, 0], train_x_z[:, 1], label='observations', s=10, c='black')
+        # ax[0].scatter(new_point_analytic_x, new_point_analytic_z, marker='d', color='red', label='Max')
+        # ax[0].legend()
+        # ax[1].set_title("Acquisition Function: $beta$=1")
+        # ax[1].contourf(plot_posterior_X, plot_posterior_Z, acq, 200, cmap='plasma', alpha=1)
+        # ax[1].scatter(new_point_analytic_x, new_point_analytic_z, marker='d', color='black', label='Max')
+        # ax[1].legend()
+
+for Generation in range(100):
+    print('The', Generation, 'th generations')
+
+    # phase of updating z
+    # phase of updating z
+    # phase of updating z
+
+    # population_copy
+    population_copy = population
+    print('the population_copy :', population_copy)
+
+    K_z = 2
+    for kz in range(K_z):
+        print('The', Generation, 'th generations,', 'The', kz, 'th optimization of z')
+
+        # the optimum with minimum objective
+        individual_min, individual_min_indices = GetOptimum(population_copy)
+
+        # fix x as the x of the optimum
+        fixed_control = individual_min[1]
+
+        # Optimization for worse z
+        model, mll, train_x_z, train_obj, new_point_analytic_x, new_point_analytic_z, new_point_analytic_f = \
+            GetWorseUncontrol(model, fixed_control, train_x_z, train_obj, beta=5.)
+
+        # replace the optimum
+        population_copy[individual_min_indices, 0] = new_point_analytic_f
+        population_copy[individual_min_indices, 1] = new_point_analytic_x
+        population_copy[individual_min_indices, 2] = new_point_analytic_z
+
+        print('the', kz, 'th updated population_copy', population_copy)
+    # phase of updating z end
+    # phase of updating z end
+    # phase of updating z end
+
+    # output the global optimum
+    optimum_min, optimum_indices = GetOptimum(population_copy)
+    optimum_control = optimum_min[1]
+    print('-----------the current global optimum of', 'the', Generation, 'th generations is', optimum_control, '------')
+
+    # phase of updating x
+    # phase of updating x
+    # phase of updating x
+
+    # sort population
+    sorted_indices = GetSortedIndices(population)
+
+    # parameters
+    K_x = 2
+    Factor_z = 0.5
+
+    print('the population :', population)
+
+    for kx in range(K_x):
+
+        print('The', Generation, 'th generations,', 'The', kx, 'th optimization of z')
+        # find the optimum in the population
+        promising_x = population[sorted_indices[kx, 0], :][1]
+
+        # Differential Evolution
+        random_pick_x_1 = population[sorted_indices[np.random.randint(0, population_n, 1)[0], 0], :][1]
+        random_pick_x_2 = population[sorted_indices[np.random.randint(0, population_n, 1)[0], 0], :][1]
+        new_x = promising_x + Factor_z*(random_pick_x_1-random_pick_x_2)
+        if new_x <= 0:
+            new_x = 0
+        if new_x >= 10:
+            new_x = 10
+
+        new_z = np.random.uniform(0, 10)
+
+        new_object = objective3(new_x, new_z)
+
+        # Replace the worse individuals in the population with new individuals
+        population[sorted_indices[-(kx + 1), 0], :][1] = new_x
+        population[sorted_indices[-(kx + 1), 0], :][2] = new_z
+        population[sorted_indices[-(kx + 1), 0], :][0] = new_object
+        print('Updated populations per round :', population)
+
+        new_data_update = population[sorted_indices[-(kx + 1), 0], :].unsqueeze(0)
+        print('the new_data_update', new_data_update)
+        print('the new_data_update shape', new_data_update.shape)
+
+        new_data_update_x = new_data_update[:, 1]
+        print('the new_data_update_x', new_data_update_x)
+        print('the new_data_update_x shape', new_data_update_x.shape)
+
+        new_data_update_z = new_data_update[:, 2]
+        print('the new_data_update_z', new_data_update_z)
+        print('the new_data_update_z shape', new_data_update_z.shape)
+
+        new_data_update_x_z = new_data_update[:, 1:3]
+        print('the new_data_update_x_z', new_data_update_x_z)
+        print('the new_data_update_x_z shape', new_data_update_x_z.shape)
+
+        smth = objective3(new_data_update_x, new_data_update_z)
+        smth = smth.unsqueeze(0)
+        train_obj = torch.cat([smth, train_obj])
+        train_x_z = torch.cat([new_data_update_x_z, train_x_z])
+
+        # end of updating x
+        # end of updating x
+        # end of updating x
+
+    # plot figures
+    # plot figures
+    # plot figures
+    plot(optimum_control)
+
+
